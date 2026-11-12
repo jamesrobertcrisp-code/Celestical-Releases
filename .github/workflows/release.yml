@@ -4,8 +4,8 @@ name: Release the desktop app
 # Start it from the Actions tab, or: gh workflow run release.yml -R jamesrobertcrisp-code/Celestical-Releases -f ref=main
 #
 # The source is read with a deploy key that can only read that one repository (secret APP_DEPLOY_KEY). The release is
-# made with this repository's own token. The version is the one in the app's package.json; a version already
-# released is refused, so bump it there first.
+# made with this repository's own token. The version is the one in the app's package.json: a new version makes a new
+# release; building a version that is already out replaces its files (each installer and its update file together).
 
 on:
   workflow_dispatch:
@@ -37,14 +37,6 @@ jobs:
           node-version: 22
       - id: v
         run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
-      - name: Refuse a version that is already out
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if gh release view "v${{ steps.v.outputs.version }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::v${{ steps.v.outputs.version }} is already released. Raise the version in the app's package.json."
-            exit 1
-          fi
       - run: npm ci
       - run: npx tsc -b && npx vitest run && npx tsc -p electron/tsconfig.json
 
@@ -116,5 +108,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           ls -la out
-          gh release create "v${{ needs.check.outputs.version }}" out/* --repo "$GITHUB_REPOSITORY" --title "Celestical ${{ needs.check.outputs.version }}" --latest \
-            --notes "Celestical ${{ needs.check.outputs.version }} for Mac, Windows and Linux. See the README for which file is yours. Windows and the Linux AppImage update themselves from here on."
+          tag="v${{ needs.check.outputs.version }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" out/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" out/* --repo "$GITHUB_REPOSITORY" --title "Celestical ${{ needs.check.outputs.version }}" --latest \
+              --notes "Celestical ${{ needs.check.outputs.version }} for Mac, Windows and Linux. See the README for which file is yours. Windows and the Linux AppImage update themselves from here on."
+          fi
