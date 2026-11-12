@@ -1,0 +1,120 @@
+name: Release the desktop app
+
+# Builds Celestical's desktop app from its (private) source and publishes the installers here.
+# Start it from the Actions tab, or: gh workflow run release.yml -R jamesrobertcrisp-code/Celestical-Releases -f ref=main
+#
+# The source is read with a deploy key that can only read that one repository (secret APP_DEPLOY_KEY). The release is
+# made with this repository's own token. The version is the one in the app's package.json; a version already
+# released is refused, so bump it there first.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or tag of the app to build
+        default: main
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  APP_REPO: jamesrobertcrisp-code/Celestical-Web-App
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.APP_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.APP_DEPLOY_KEY }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - id: v
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+      - name: Refuse a version that is already out
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.v.outputs.version }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::v${{ steps.v.outputs.version }} is already released. Raise the version in the app's package.json."
+            exit 1
+          fi
+      - run: npm ci
+      - run: npx tsc -b && npx vitest run && npx tsc -p electron/tsconfig.json
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: --mac
+            native: mac-arm64 mac-x64
+          - os: ubuntu-latest
+            target: --linux
+            native: linux-x64 linux-arm64
+          - os: windows-latest
+            target: --win
+            native: win-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.APP_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.APP_DEPLOY_KEY }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      # Electron's own binary is a separate download in this version of the package.
+      - run: node node_modules/electron/install.js
+      # The cloud project is optional for the desktop app; baking it in means cloud sync works out of the box.
+      # Both values are public by design (they are in the website's own script).
+      - run: npm run build
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+      - run: node scripts/build-electron.mjs
+      # the speech libraries, staged per target and copied beside the app as it is packed
+      - run: node scripts/native-deps.mjs ${{ matrix.native }}
+      # --publish never: the files are uploaded once, below, so three runners never race to make the same release.
+      # The update files (latest*.yml) are still written.
+      - run: npx electron-builder ${{ matrix.target }} --publish never
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: celestical-${{ runner.os }}
+          retention-days: 3
+          path: |
+            release/*.dmg
+            release/*.AppImage
+            release/*.deb
+            release/*.exe
+            release/*.blockmap
+            release/latest*.yml
+          if-no-files-found: error
+
+  publish:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la out
+          gh release create "v${{ needs.check.outputs.version }}" out/* --repo "$GITHUB_REPOSITORY" --title "Celestical ${{ needs.check.outputs.version }}" --latest \
+            --notes "Celestical ${{ needs.check.outputs.version }} for Mac, Windows and Linux. See the README for which file is yours. Windows and the Linux AppImage update themselves from here on."
